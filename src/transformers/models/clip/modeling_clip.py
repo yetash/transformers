@@ -857,6 +857,8 @@ class CLIPTextTransformer(nn.Module):
         output_attentions: Optional[bool] = None,
         output_hidden_states: Optional[bool] = None,
         return_dict: Optional[bool] = None,
+        last_word_idx: Optional[torch.Tensor] = None,
+        input_attention_mask: Optional[torch.Tensor] = None
     ) -> Union[Tuple, BaseModelOutputWithPooling]:
         r"""
         Returns:
@@ -881,11 +883,14 @@ class CLIPTextTransformer(nn.Module):
         causal_attention_mask = _create_4d_causal_attention_mask(
             input_shape, hidden_states.dtype, device=hidden_states.device
         )
-
-        # expand attention_mask
-        if attention_mask is not None and not self._use_flash_attention_2:
-            # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
-            attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
+        
+        if input_attention_mask is not None:
+            attention_mask = input_attention_mask
+        else:
+            # expand attention_mask
+            if attention_mask is not None and not self._use_flash_attention_2:
+                # [bsz, seq_len] -> [bsz, 1, tgt_seq_len, src_seq_len]
+                attention_mask = _prepare_4d_attention_mask(attention_mask, hidden_states.dtype)
 
         encoder_outputs = self.encoder(
             inputs_embeds=hidden_states,
@@ -900,16 +905,20 @@ class CLIPTextTransformer(nn.Module):
         last_hidden_state = self.final_layer_norm(last_hidden_state)
 
         if self.eos_token_id == 2:
-            # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
-            # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
-            # ------------------------------------------------------------
-            # text_embeds.shape = [batch_size, sequence_length, transformer.width]
-            # take features from the eot embedding (eot_token is the highest number in each sequence)
-            # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
-            pooled_output = last_hidden_state[
-                torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
-                input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
-            ]
+            if last_word_idx != None:
+                pooled_output_list = [last_hidden_state[i,last_word_idx[i]].unsqueeze(0) for i in range(last_hidden_state.shape[0])]
+                pooled_output = torch.concat(pooled_output_list, dim=0)
+            else:
+                # The `eos_token_id` was incorrect before PR #24773: Let's keep what have been done here.
+                # A CLIP model with such `eos_token_id` in the config can't work correctly with extra new tokens added
+                # ------------------------------------------------------------
+                # text_embeds.shape = [batch_size, sequence_length, transformer.width]
+                # take features from the eot embedding (eot_token is the highest number in each sequence)
+                # casting to torch.int for onnx compatibility: argmax doesn't support int64 inputs with opset 14
+                pooled_output = last_hidden_state[
+                    torch.arange(last_hidden_state.shape[0], device=last_hidden_state.device),
+                    input_ids.to(dtype=torch.int, device=last_hidden_state.device).argmax(dim=-1),
+                ]
         else:
             # The config gets updated `eos_token_id` from PR #24773 (so the use of exta new tokens is possible)
             pooled_output = last_hidden_state[
